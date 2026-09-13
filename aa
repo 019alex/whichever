@@ -1,0 +1,92 @@
+# %% ==========================================================================
+# [D3] CONFUSION MATRIX + ERROR DRIVERS
+#
+# READ THIS FIRST -- the golden is NON-EXHAUSTIVE, so a standard 2x2 is
+# misleading and precision is not a valid metric:
+#   TP  = model linked   AND golden linked          -> genuinely correct
+#   FN  = model not-linked BUT golden linked        -> mostly golden over-mapping
+#   FP  = model linked   BUT not in golden          -> DISCOVERIES, not errors
+#   TN  = model not-linked AND not in golden        -> contaminated: contains
+#         both true negatives and real links nobody has recorded yet
+# The matrix is printed to show WHERE errors concentrate, not to produce an
+# accuracy number. The per-risk / per-record tables are the actionable part.
+# =============================================================================
+
+v = verdicts.copy()
+v["REC"], v["RISK"] = _norm_id(v.RECORD_ID), _norm_id(v.LIB_RISK)
+v["DEC"] = v.decision.astype(str).str.strip().str.upper()
+rank = {"LINKED": 4, "INSUFFICIENT_EVIDENCE": 3, "NOT_LINKED": 2, "MISSING": 1, "ERROR": 0}
+v["_r"] = v.DEC.map(rank).fillna(-1)
+v = v.sort_values("_r", ascending=False).drop_duplicates(["REC", "RISK"])
+
+gsub = golden[~golden.LIB_RISK.isin(_BLANK)]
+golden_pairs = set(gsub.RECORD_ID + "|" + gsub.LIB_RISK)
+v["key"]    = v.REC + "|" + v.RISK
+v["golden"] = v.key.isin(golden_pairs)
+v["pred"]   = v.DEC.eq("LINKED")
+
+v["cell"] = np.select(
+    [ v.pred &  v.golden,  ~v.pred &  v.golden,  v.pred & ~v.golden],
+    ["TP",                "FN",                 "FP"],
+    default="TN")
+
+TP = int((v.cell == "TP").sum()); FN = int((v.cell == "FN").sum())
+FP = int((v.cell == "FP").sum()); TN = int((v.cell == "TN").sum())
+
+bar = "=" * 74
+print(bar); print("[D3] CONFUSION MATRIX  (judged pairs only)"); print(bar)
+print(f"{'':22s}{'golden = LINKED':>18s}{'golden = not linked':>22s}")
+print(f"{'model = LINKED':22s}{TP:>18,}{FP:>22,}")
+print(f"{'model = NOT_LINKED':22s}{FN:>18,}{TN:>22,}")
+print(f"\n  total judged pairs : {len(v):,}")
+print(f"  recall (TP/(TP+FN)): {TP/max(TP+FN,1):.1%}")
+print(f"  precision          : NOT REPORTED -- golden is non-exhaustive, so the")
+print(f"                       {FP:,} 'FP' are candidate DISCOVERIES, not errors.")
+
+# --- FN quality split: which misses are real? --------------------------------
+if "audited" in globals() and len(audited):
+    a = audited[["REC", "RISK", "audit_category", "sub_reason"]].copy()
+    fn = v[v.cell == "FN"].merge(a, on=["REC", "RISK"], how="left")
+    real = fn.audit_category.isin(["TRUE_LINK_MISSED"]).sum()
+    sme  = fn.audit_category.isin(["SME_JUDGEMENT_REQUIRED", "TEXT_TOO_THIN"]).sum()
+    art  = fn.audit_category.isin(["CORRECT_REJECTION", "STRUCTURAL_OVERMAPPING"]).sum()
+    print("\n" + "-" * 60)
+    print("  FN QUALITY SPLIT (audit-labelled):")
+    print(f"    real misses (TRUE_LINK_MISSED)     : {real:,}  <- FIX THESE")
+    print(f"    not model-addressable (SME / thin) : {sme:,}")
+    print(f"    golden artefact (CR / over-mapping): {art:,}  <- not model errors")
+    print(f"    >>> ADJUSTED RECALL = {TP:,}/{TP+real+sme:,} = {TP/max(TP+real+sme,1):.1%}")
+
+# --- WHICH RISKS DRIVE THE ERRORS -------------------------------------------
+lr_title = dict(zip(helios.LIB_RISK, helios.library_risk_title))
+by_risk = (v.groupby("RISK").cell.value_counts().unstack(fill_value=0)
+             .reindex(columns=["TP", "FN", "FP", "TN"], fill_value=0))
+by_risk["judged"] = by_risk.sum(axis=1)
+by_risk["recall"] = by_risk.TP / (by_risk.TP + by_risk.FN).replace(0, np.nan)
+by_risk["title"]  = by_risk.index.map(lambda r: (lr_title.get(r, "") or "")[:52])
+
+print("\n" + bar); print("[D3] WORST RISKS BY FN VOLUME  (where to aim the prompt fix)"); print(bar)
+print(by_risk.sort_values("FN", ascending=False)
+             .head(15)[["title", "TP", "FN", "FP", "recall"]].to_string())
+
+print("\n" + bar); print("[D3] RISKS WITH MOST DISCOVERIES  (send to SME)"); print(bar)
+print(by_risk.sort_values("FP", ascending=False)
+             .head(10)[["title", "TP", "FN", "FP"]].to_string())
+
+# --- WHICH RECORDS DRIVE THE ERRORS -----------------------------------------
+by_rec = (v.groupby("REC").cell.value_counts().unstack(fill_value=0)
+            .reindex(columns=["TP", "FN", "FP", "TN"], fill_value=0))
+by_rec["recall"] = by_rec.TP / (by_rec.TP + by_rec.FN).replace(0, np.nan)
+print("\n" + bar); print("[D3] WORST RECORDS BY FN VOLUME"); print(bar)
+print(by_rec.sort_values("FN", ascending=False).head(10).to_string())
+
+# --- ZERO-RECALL RISKS: never linked, always in golden -----------------------
+never = by_risk[(by_risk.TP == 0) & (by_risk.FN > 0)].sort_values("FN", ascending=False)
+print("\n" + bar); print(f"[D3] RISKS THE MODEL NEVER LINKS  (n={len(never)})"); print(bar)
+print(never.head(15)[["title", "FN", "judged"]].to_string())
+print("\n  These are the highest-leverage prompt targets: a risk the model links")
+print("  ZERO times but golden links often is either a horizontal/meta risk the")
+print("  prompt is over-gating, or a vocabulary gap. Read 3 of each in [F2].")
+
+v.to_excel(OUTPUT_DIR / "confusion_pairs.xlsx", index=False)
+by_risk.sort_values("FN", ascending=False).to_excel(OUTPUT_DIR / "error_by_risk.xlsx")
